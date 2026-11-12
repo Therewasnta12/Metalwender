@@ -728,7 +728,7 @@ public class CustomChunkMesher {
                 if (!snapshot.valid) {
                     int v = DIAG_INVALID.incrementAndGet();
                     if (v % 2000 == 1) {
-                        MetalLogger.info("builddiag: invalid_snapshot=%d empty=%d built=%d",
+                        MetalLogger.debug("builddiag: invalid_snapshot=%d empty=%d built=%d",
                                 DIAG_INVALID.get(), DIAG_EMPTY.get(), DIAG_BUILT.get());
                     }
                     return;
@@ -749,7 +749,7 @@ public class CustomChunkMesher {
                 long acc = BUILD_WALL_ACC.getAndAdd(taskWall);
                 int cnt = BUILD_WALL_CNT.incrementAndGet();
                 if (cnt % 1000 == 0) {
-                    MetalLogger.info(
+                    MetalLogger.debug(
                             "builddiag: avg_wall=%.2fms over %d tasks sub=%d cancel=%d new=%d repl=%d inv=%d empty=%d mdirty=%d cchanged=%d",
                             (double) acc / cnt / 1e6, cnt, DIAG_SUBMIT.get(), DIAG_CANCEL.get(), DIAG_NEW.get(),
                             DIAG_REPLACE.get(), DIAG_INVALID.get(), DIAG_EMPTY.get(), DIAG_MARKDIRTY.get(),
@@ -862,22 +862,19 @@ public class CustomChunkMesher {
         DIAG_MARKDIRTY.incrementAndGet();
         long key = packChunkKey(cx, cy, cz);
         boolean newlyDirty;
-        synchronized (dirtyKeys) {
-            newlyDirty = dirtyKeys.add(key);
+        synchronized (dirtyGeneration) {
+            synchronized (dirtyKeys) {
+                newlyDirty = dirtyKeys.add(key);
+            }
+            dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
         }
-        if (!newlyDirty) {
-            return;
-        }
-        connectivityDirtyGeneration.incrementAndGet();
+        if (newlyDirty) connectivityDirtyGeneration.incrementAndGet();
         noteRebuild(reason);
         synchronized (emptyKeys) {
             emptyKeys.remove(key);
         }
         synchronized (pendingKeys) {
             pendingKeys.remove(key);
-        }
-        synchronized (dirtyGeneration) {
-            dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
         }
     }
 
@@ -1157,6 +1154,7 @@ public class CustomChunkMesher {
                 old = meshCache.remove(key);
             }
         }
+        com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().nearMask().invalidate(cx, cz);
         if (old != null) {
             NativeBridge.nUnregisterChunkMesh(cx, cy, cz);
             if (old.bufferHandle != 0) {
@@ -1177,6 +1175,7 @@ public class CustomChunkMesher {
     }
 
     public void clearAllMeshes() {
+        com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().nearMask().invalidateAll();
         invalidateThreadLocalCaches();
         destroyAllStashedVariants();
         synchronized (variantLock) {
@@ -1538,8 +1537,12 @@ public class CustomChunkMesher {
         synchronized (emptyKeys) {
             emptyKeys.add(key);
         }
-        synchronized (dirtyKeys) {
-            dirtyKeys.remove(key);
+        synchronized (dirtyGeneration) {
+            if (dirtyGeneration.get(key) == generation) {
+                synchronized (dirtyKeys) {
+                    dirtyKeys.remove(key);
+                }
+            }
         }
         meshUpdateGeneration.incrementAndGet();
         recordVisibleLatency(key);
@@ -2784,8 +2787,12 @@ public class CustomChunkMesher {
             recordBuiltLightHashes(key, snapshot);
             recordVisibleLatency(key);
             MetalRenderProfiler.getInstance().incrementMeshesBuilt(1);
-            synchronized (dirtyKeys) {
-                if (dirtyKeys.remove(key)) connectivityDirtyGeneration.incrementAndGet();
+            synchronized (dirtyGeneration) {
+                if (dirtyGeneration.get(key) == generation) {
+                    synchronized (dirtyKeys) {
+                        if (dirtyKeys.remove(key)) connectivityDirtyGeneration.incrementAndGet();
+                    }
+                }
             }
         } catch (Exception e) {
             java.io.StringWriter sw = new java.io.StringWriter();

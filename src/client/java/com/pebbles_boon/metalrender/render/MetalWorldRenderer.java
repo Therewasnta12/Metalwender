@@ -306,6 +306,7 @@ public class MetalWorldRenderer {
     private long outlineBufferHandle;
     private long jBuildAcc;
     private int jProfCount = 0;
+    private long lastJavaProfileLogMs;
     private boolean gpuDrivenEnabled;
     private MeshShaderBackend meshShaderBackend;
     private ByteBuffer subChunkUploadBuffer;
@@ -478,6 +479,7 @@ public class MetalWorldRenderer {
     }
 
     public void onWorldUnload() {
+        com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().onWorldUnload();
         stopCaveWorker();
         worldLoaded = false;
         renderingActive = false;
@@ -537,6 +539,7 @@ public class MetalWorldRenderer {
         loggedWorldLoadWithoutRenderer = false;
         delayedBlockRebuildFrames.clear();
         urgentEditSet.clear();
+        lightUpdates.clear();
         frameCount = 0;
         lastDrawnChunkCount = 0;
         if (meshShaderBackend != null) {
@@ -725,9 +728,12 @@ public class MetalWorldRenderer {
                 } catch (Exception ignored) {
                 }
             }
-            jBuildAcc += System.nanoTime() - buildStart;
-            jProfCount++;
-            if (jProfCount >= 120) {
+            if (MetalRenderConfig.isDeepDebugActive()) {
+                jBuildAcc += System.nanoTime() - buildStart;
+                jProfCount++;
+            }
+            if (jProfCount > 0 && now - lastJavaProfileLogMs >= 5000) {
+                lastJavaProfileLogMs = now;
                 double buildMs = jBuildAcc / 1e6 / jProfCount;
                 MetalLogger.info(
                         "java_profile: build=%.2f (avg/%d) p=%d q=%d m=%d "
@@ -853,6 +859,17 @@ public class MetalWorldRenderer {
             }
         }
         NativeBridge.nSetReuseTerrainFrame(false);
+        try {
+            net.minecraft.client.Minecraft fmc = net.minecraft.client.Minecraft.getInstance();
+            net.minecraft.world.entity.Entity fce = fmc.getCameraEntity();
+            net.minecraft.world.phys.Vec3 look = fce != null ? fce.getViewVector(1.0f) : null;
+            com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().setView(projectionMatrix.m11(),
+                    projectionMatrix.m00(), fmc.getWindow().getHeight(), look != null ? (float) look.x : 0.0f,
+                    look != null ? (float) look.z : 1.0f);
+            com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().frame(cameraX, cameraY, cameraZ);
+        } catch (Throwable t) {
+            MetalLogger.warn("far terrain frame failed: %s", t.toString());
+        }
         externalIndexBuffer = 0;
         long frameCtx = external ? 1L : renderer.frameCtx();
         if (frameCtx != 0) {
@@ -909,7 +926,7 @@ public class MetalWorldRenderer {
                     lastDrawnChunkCount = drawn;
                     MetalRenderProfiler.getInstance().incrementChunksDrawn(drawn);
                     if (frameCount < 10 || frameCount % 1000 == 0) {
-                        MetalLogger.info("frame %d: drew %d chunks",
+                        MetalLogger.debug("frame %d: drew %d chunks",
                                 frameCount, lastDrawnChunkCount);
                     }
                 } else {
@@ -1058,7 +1075,7 @@ public class MetalWorldRenderer {
             lastDrawnChunkCount = drawn;
             MetalRenderProfiler.getInstance().incrementChunksDrawn(drawn);
             if (frameCount < 10 || frameCount % 1000 == 0) {
-                MetalLogger.info("frame %d: drew %d chunks (backend)", frameCount, drawn);
+                MetalLogger.debug("frame %d: drew %d chunks (backend)", frameCount, drawn);
             }
         });
     }
@@ -1246,6 +1263,7 @@ public class MetalWorldRenderer {
     private final it.unimi.dsi.fastutil.longs.LongOpenHashSet pendingBuildSet = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
     private final it.unimi.dsi.fastutil.longs.LongArrayList sortedBuildList = new it.unimi.dsi.fastutil.longs.LongArrayList();
     private final it.unimi.dsi.fastutil.longs.LongOpenHashSet urgentEditSet = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
+    private final java.util.Set<Long> lightUpdates = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final int URGENT_EDIT_MAX_PER_FRAME = 32;
     private long[] sortKeyScratch = new long[1024];
     private final it.unimi.dsi.fastutil.longs.LongArrayList sortReorderScratch = new it.unimi.dsi.fastutil.longs.LongArrayList();
@@ -1484,7 +1502,8 @@ public class MetalWorldRenderer {
             lastScanMs = scanNs / 1_000_000.0;
             MetalRenderProfiler.getInstance().recordScanTime(scanNs);
         }
-        if (mc.player != null && chunkMesher.getMeshCount() < maxMeshes) {
+        if (mc.player != null) {
+            drainLightSectionRebuilds();
             int playerChunkX = mc.player.chunkPosition().x();
             int playerChunkZ = mc.player.chunkPosition().z();
             int playerSectionY = mc.player.getBlockY() >> 4;
@@ -1729,7 +1748,7 @@ public class MetalWorldRenderer {
             long now = System.currentTimeMillis();
             if (now - lastTrimLogMs >= 2000) {
                 lastTrimLogMs = now;
-                MetalLogger.info(
+                MetalLogger.deepInfo(
                         "queue_trim: keep=%d player=[%d,%d] p=%d cp=%d m=%d",
                         keepRange, playerChunkX, playerChunkZ, pendingBuildSet.size(),
                         chunkMesher.getPendingCount(), chunkMesher.getMeshCount());
@@ -2066,9 +2085,9 @@ public class MetalWorldRenderer {
             }
             built++;
         }
-        if (built > 0 && System.currentTimeMillis() - lastQueuePressureLogMs >= 1000) {
+        if (built > 0 && System.currentTimeMillis() - lastQueuePressureLogMs >= 5000) {
             lastQueuePressureLogMs = System.currentTimeMillis();
-            MetalLogger.info(
+            MetalLogger.deepInfo(
                     "build_pass: built=%d imp=%d bg=%d p=%d cp=%d m=%d bud=%d",
                     built, importantSubmitted, backgroundSubmissions,
                     pendingBuildSet.size(), chunkMesher.getPendingCount(),
@@ -2076,7 +2095,7 @@ public class MetalWorldRenderer {
         }
         if (lightSkipped > 0 && System.currentTimeMillis() - lastLightWaitLogMs >= 5000) {
             lastLightWaitLogMs = System.currentTimeMillis();
-            MetalLogger.info("light_wait: %d sections held for skylight data (p=%d)",
+            MetalLogger.deepInfo("light_wait: %d sections held for skylight data (p=%d)",
                     lightSkipped, pendingBuildSet.size());
         }
         return built;
@@ -2860,6 +2879,7 @@ public class MetalWorldRenderer {
         pendingBuildSet.clear();
         sortedBuildList.clear();
         urgentEditSet.clear();
+        lightUpdates.clear();
         sortedListDirty = true;
         scanFrameCounter = 0;
         scanFrontierRing = 0;
@@ -2878,6 +2898,7 @@ public class MetalWorldRenderer {
     }
 
     public void onChunkLoaded(int chunkX, int chunkZ, LevelChunk chunk) {
+        com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().onChunkLoaded(chunk);
         if (!worldLoaded || !renderingActive) {
             if (!loggedChunkLoadDropNotReady) {
                 loggedChunkLoadDropNotReady = true;
@@ -2934,7 +2955,7 @@ public class MetalWorldRenderer {
             refreshLoadedHorizontalNeighbor(chunkX, worldY, chunkZ, chunkX, chunkZ + 1);
         }
         if (MetalRenderConfig.isDeepDebugActive()) {
-            MetalLogger.info(
+            MetalLogger.debug(
                     "chunk_load: c=[%d,%d] sec=%d air=%d d=%d imm=%s pri=%s p=%d cp=%d",
                     chunkX, chunkZ, sections.length, nonAirSections, loadedChunkDistance,
                     immediateBuildChunk, highPriorityChunk, pendingBuildSet.size(),
@@ -3071,6 +3092,20 @@ public class MetalWorldRenderer {
         onLightDataApplied(chunkX, chunkY, chunkZ, false, false, 0L);
     }
 
+    public void queueLightSectionRebuild(int chunkX, int chunkY, int chunkZ) {
+        lightUpdates.add(packChunkKey(chunkX, chunkY, chunkZ));
+    }
+
+    private void drainLightSectionRebuilds() {
+        for (long key : lightUpdates) {
+            if (!lightUpdates.remove(key)) continue;
+            int cx = unpackChunkX(key), cy = unpackChunkY(key), cz = unpackChunkZ(key);
+            if (!chunkMesher.hasMeshIgnoreDirty(cx, cy, cz) && !chunkMesher.isBuildPending(cx, cy, cz)) continue;
+            chunkMesher.contentChanged(cx, cy, cz, "light_update");
+            queueUrgentEdit(cx, cy, cz);
+        }
+    }
+
     public void onLightDataApplied(int chunkX, int chunkY, int chunkZ,
             boolean skyLayer, boolean hasData, long incomingHash) {
         if (!worldLoaded || !renderingActive) {
@@ -3163,6 +3198,7 @@ public class MetalWorldRenderer {
     }
 
     public void scheduleSectionRebuild(int blockX, int blockY, int blockZ) {
+        com.pebbles_boon.metalrender.render.far.FarTerrainManager.get().onBlockChanged(blockX, blockZ);
         if (!worldLoaded || !renderingActive) {
             if (!loggedBlockUpdateDropNotReady) {
                 loggedBlockUpdateDropNotReady = true;
@@ -3198,7 +3234,7 @@ public class MetalWorldRenderer {
             markDirtyAndQueue(cx, cy, cz + 1);
         }
         if (MetalRenderConfig.isDeepDebugActive()) {
-            MetalLogger.info(
+            MetalLogger.debug(
                     "block_rebuild: b=[%d,%d,%d] s=[%d,%d,%d] p=%d cp=%d m=%d",
                     blockX, blockY, blockZ, cx, cy, cz, pendingBuildSet.size(),
                     chunkMesher.getPendingCount(), chunkMesher.getMeshCount());
@@ -3224,9 +3260,6 @@ public class MetalWorldRenderer {
         if (urgentEditSet.isEmpty()) {
             return 0;
         }
-        if (chunkMesher.getMeshCount() >= maxMeshes) {
-            return 0;
-        }
         long[] keys = urgentEditSet.toLongArray();
         int submitted = 0;
         for (long key : keys) {
@@ -3238,10 +3271,6 @@ public class MetalWorldRenderer {
             int cz = unpackChunkZ(key);
             boolean ok = chunkMesher.buildMeshFromWorldInteractive(cx, cy, cz);
             if (!ok) {
-                if (pendingBuildSet.add(key)) {
-                    sortedListDirty = true;
-                }
-                urgentEditSet.remove(key);
                 continue;
             }
             urgentEditSet.remove(key);
