@@ -245,7 +245,7 @@ public final class MetalDeviceBackend implements GpuDeviceBackend {
 
     @Override
     public DeviceInfo getDeviceInfo() {
-        return new DeviceInfo(deviceName, "Apple", "Metal 3", true, "Metal", 1.0f,
+        return new DeviceInfo(deviceName, "Apple", "Metal 4", true, "Metal", 1.0f,
                 new DeviceLimits(16, 256, 16384, Long.MAX_VALUE, 0, 1, 0),
                 new DeviceFeatures(true, false, false, false, false, false, false, false), Set.of(),
                 new HintsAndWorkarounds(false, false, false, false), DeviceType.INTEGRATED);
