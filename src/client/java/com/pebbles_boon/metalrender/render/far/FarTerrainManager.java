@@ -91,6 +91,7 @@ public final class FarTerrainManager {
     private final LongOpenHashSet scaffold = new LongOpenHashSet();
     private LongOpenHashSet rootKeys = new LongOpenHashSet();
     private final Long2LongOpenHashMap uncoveredSince = new Long2LongOpenHashMap();
+    private long idleSince;
     private final LongOpenHashSet desiredAnc = new LongOpenHashSet();
     private float farRadius;
     private float radiusScale = 1.0f;
@@ -125,6 +126,7 @@ public final class FarTerrainManager {
     private float lastPixelScale = -1.0f;
     private int pixelVotes;
     private boolean zoomedView;
+    private volatile double zoomK = 2.0;
     private float basePixelScale = 700.0f;
     private final LongOpenHashSet refined = new LongOpenHashSet();
     private boolean selectSoon;
@@ -269,6 +271,7 @@ public final class FarTerrainManager {
         initializing = true;
         lastFlush = System.currentTimeMillis();
         boolean seedGen = cfg.farSeedGen;
+        boolean blendBiomes = cfg.farBiomeBlend;
         String manual = cfg.farSeed;
         startedMem = cfg.farMemoryMb;
         startedOpts = buildOpts(cfg);
@@ -308,6 +311,9 @@ public final class FarTerrainManager {
                 sd = seedGen ? FarSeedSource.forLevel(lvl, manual) : null;
             } catch (Throwable t) {
                 MetalLogger.warn("far seed init failed: %s", t.toString());
+            }
+            if (sd != null) {
+                sd.blend = blendBiomes;
             }
             FarStore st = new FarStore(dir, mem, disk, sd != null ? sd.fingerprint : 0L,
                     FarStateIds.registryFingerprint());
@@ -619,7 +625,7 @@ public final class FarTerrainManager {
         if (initializing || store == null) {
             return;
         }
-        int opts = (cfg.farFlatColor ? 1 : 0) | (cfg.farHiZ ? 16 : 0);
+        int opts = (cfg.farFlatColor ? 1 : 0) | (cfg.farHiZ ? 16 : 0) | (cfg.farLodFade ? 32 : 0);
         if (opts != sentOpts) {
             sentOpts = opts;
             NativeBridge.nFarSetOptions(opts);
@@ -812,6 +818,8 @@ public final class FarTerrainManager {
 
     private void select(double cx, double cz, int rd) {
         selRd = rd;
+        var zc = MetalRenderClient.getConfig();
+        zoomK = zc != null && zc.farZoomSaver ? 1.0 : 2.0;
         LongOpenHashSet next = new LongOpenHashSet(desired.size() + 64);
         refined.clear();
         if (zoomedView) {
@@ -973,7 +981,7 @@ public final class FarTerrainManager {
     }
 
     private static int buildOpts(MetalRenderConfig cfg) {
-        return (cfg.farCompactQuads ? 1 : 0) | (cfg.farWaterPlane ? 2 : 0);
+        return (cfg.farCompactQuads ? 1 : 0) | (cfg.farWaterPlane ? 2 : 0) | (cfg.farBiomeBlend ? 8 : 0);
     }
 
     private double roughFactor(long key) {
@@ -1016,7 +1024,7 @@ public final class FarTerrainManager {
             }
             int tl = lv == 2 ? 1 : lv;
             boolean boost = zoomedView && inView(key, cx, cz);
-            double threshold = (boost ? 2.0 * pixelScale : Math.min((double) quality, 2.0 * basePixelScale))
+            double threshold = (boost ? zoomK * pixelScale : Math.min((double) quality, 2.0 * basePixelScale))
                     * (1L << (tl - 1));
             boolean wasSplit = !desired.contains(key);
             double rf = roughFactor(key);
@@ -1159,6 +1167,14 @@ public final class FarTerrainManager {
             handled.add(b);
         }
         long nowMs = System.currentTimeMillis();
+        if (inflight.isEmpty() && uploaded.isEmpty() && uploadQueue.isEmpty()) {
+            if (idleSince == 0L) {
+                idleSince = nowMs;
+            }
+        } else {
+            idleSince = 0L;
+        }
+        boolean quiet = idleSince != 0L && nowMs - idleSince > 3000L;
         var cit = desired.iterator();
         while (cit.hasNext()) {
             long k = cit.nextLong();
@@ -1172,14 +1188,15 @@ public final class FarTerrainManager {
                 continue;
             }
             long age = nowMs - since;
+            if (!(age > 45000L || (quiet && age > 4000L))) {
+                continue;
+            }
             if (built.contains(k)) {
-                if (age > 2500L) {
-                    show.add(k);
-                    handled.add(k);
-                }
-            } else if (age > 12000L && (inflight.remove(k) | uploaded.remove(k))) {
+                show.add(k);
+                handled.add(k);
+            } else if (age > 60000L && (inflight.remove(k) | uploaded.remove(k))) {
                 uncoveredSince.put(k, nowMs);
-            } else if (age > 5000L && inflight.size() < 48 && !inflight.contains(k) && !uploaded.contains(k)) {
+            } else if (inflight.size() < 48 && !inflight.contains(k) && !uploaded.contains(k)) {
                 submitBuild(k, 0.0);
             }
         }
